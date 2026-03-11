@@ -1,26 +1,26 @@
 import asyncio
 import os
-import logging
 import time
 import random
+import logging
 from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import yt_dlp
 
-# ===============================
+# =========================
 # Logging
-# ===============================
+# =========================
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("yt-audio-server")
+log = logging.getLogger("rava")
 
-# ===============================
-# FastAPI App
-# ===============================
-app = FastAPI(title="YouTube Audio Streaming API")
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="RAVA Audio API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,251 +30,245 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===============================
+# =========================
 # Config
-# ===============================
-CACHE_DIR = os.environ.get("CACHE_DIR", "/tmp/audio-cache")
+# =========================
+CACHE_DIR = "/tmp/audio-cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-SEARCH_LIMIT = 10
-PREFETCH_COUNT = 3
-MAX_CACHE_FILES = 40
-STREAM_TTL = 60 * 60 * 3  # 3 hours
-
-# Stream URL cache (video_id → data)
 STREAM_CACHE: Dict[str, Dict] = {}
 
-# Ad config
-AD_CHANNEL_URL = "https://youtube.com/@sannekaribo?si=80dbAyxWSWgjCyEA"
-AD_VIDEOS_CACHE: List[str] = []  # will store fetched video IDs
-AD_PERCENT = 10  # default 10%, can be changed via /admin
+STREAM_TTL = 7200
+MAX_CACHE_FILES = 40
+SEARCH_LIMIT = 12
 
-# ===============================
-# yt-dlp Options
-# ===============================
-BASE_YTDLP_OPTS = {
+# =========================
+# yt-dlp Anti Bot Setup
+# =========================
+BASE_OPTS = {
     "quiet": True,
-    "socket_timeout": 15,
-    "extractor_args": {"youtube": {"player_client": ["android"]}}
+    "socket_timeout": 20,
+    "retries": 3,
+    "nocheckcertificate": True,
+    "http_headers": {
+        "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        " AppleWebKit/537.36 (KHTML, like Gecko)"
+        " Chrome/121.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    },
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+            "skip": ["dash", "hls"]
+        }
+    }
 }
 
-SEARCH_OPTS = {**BASE_YTDLP_OPTS, "skip_download": True, "extract_flat": "in_playlist"}
-INFO_OPTS = {**BASE_YTDLP_OPTS}
+SEARCH_OPTS = {
+    **BASE_OPTS,
+    "extract_flat": True,
+    "skip_download": True
+}
+
 DOWNLOAD_OPTS = {
-    **BASE_YTDLP_OPTS,
-    "format": "bestaudio[ext=m4a]/bestaudio/best",
-    "outtmpl": f"{CACHE_DIR}/%(id)s.%(ext)s",
+    **BASE_OPTS,
+    "format": "bestaudio/best",
     "noplaylist": True,
+    "outtmpl": f"{CACHE_DIR}/%(id)s.%(ext)s"
 }
 
-# ===============================
-# Async helper
-# ===============================
+# =========================
+# Async executor
+# =========================
 async def run_blocking(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, func, *args)
 
-# ===============================
-# Cache cleanup
-# ===============================
-def cleanup_cache():
-    try:
-        files = sorted(
-            [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR)],
-            key=os.path.getmtime
-        )
-        if len(files) > MAX_CACHE_FILES:
-            for f in files[: len(files) - MAX_CACHE_FILES]:
-                try:
-                    os.remove(f)
-                except:
-                    pass
-    except Exception as e:
-        log.warning(f"Cache cleanup error: {e}")
-
-# ===============================
-# Stream Cache Helpers
-# ===============================
+# =========================
+# Cache helpers
+# =========================
 def get_cached_stream(video_id):
-    data = STREAM_CACHE.get(video_id)
-    if not data:
+    c = STREAM_CACHE.get(video_id)
+    if not c:
         return None
-    if time.time() > data["expires"]:
-        del STREAM_CACHE[video_id]
+    if time.time() > c["exp"]:
+        STREAM_CACHE.pop(video_id, None)
         return None
-    return data["url"]
+    return c["url"]
 
 def set_cached_stream(video_id, url):
-    STREAM_CACHE[video_id] = {"url": url, "expires": time.time() + STREAM_TTL}
+    STREAM_CACHE[video_id] = {
+        "url": url,
+        "exp": time.time() + STREAM_TTL
+    }
 
-# ===============================
-# Extract audio stream (robust)
-# ===============================
-def extract_audio_stream(video_id):
-    # Check cache
+# =========================
+# Cleanup audio cache
+# =========================
+def cleanup_cache():
+
+    files = sorted(
+        [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR)],
+        key=os.path.getmtime
+    )
+
+    if len(files) > MAX_CACHE_FILES:
+        for f in files[:len(files) - MAX_CACHE_FILES]:
+            try:
+                os.remove(f)
+            except:
+                pass
+
+# =========================
+# Extract stream
+# =========================
+def extract_stream(video_id):
+
     cached = get_cached_stream(video_id)
     if cached:
         return cached
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://youtube.com/watch?v={video_id}"
 
-    # Retry loop for transient network/yt-dlp issues
-    last_exception = None
-    for _ in range(3):
-        try:
-            with yt_dlp.YoutubeDL(INFO_OPTS) as ydl:
-                info = ydl.extract_info(url, download=False)
+    time.sleep(random.uniform(0.5,1.5))
 
-            # Try audio-only
-            audio_url = None
-            for f in info.get("formats", []):
-                if f.get("vcodec") == "none" and f.get("acodec") != "none":
-                    audio_url = f["url"]
-                    break
+    with yt_dlp.YoutubeDL(BASE_OPTS) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-            # Fallback: best available audio
-            if not audio_url:
-                formats = info.get("formats", [])
-                formats = sorted(formats, key=lambda x: x.get("abr") or 0, reverse=True)
-                for f in formats:
-                    if f.get("acodec") != "none":
-                        audio_url = f["url"]
-                        break
+    for f in info["formats"]:
+        if f.get("vcodec") == "none" and f.get("acodec") != "none":
+            stream = f["url"]
+            set_cached_stream(video_id, stream)
+            return stream
 
-            if not audio_url:
-                raise Exception("Audio stream not found")
+    raise Exception("No audio stream found")
 
-            set_cached_stream(video_id, audio_url)
-            return audio_url
+# =========================
+# YouTube search
+# =========================
+def yt_search(query):
 
-        except Exception as e:
-            last_exception = e
-            time.sleep(1)
+    time.sleep(random.uniform(0.5,1.2))
 
-    raise Exception(f"Failed to get audio stream: {last_exception}")
-
-# ===============================
-# Prefetch streams
-# ===============================
-async def prefetch_streams(results):
-    for v in results[:PREFETCH_COUNT]:
-        vid = v.get("id")
-        if vid in STREAM_CACHE:
-            continue
-        try:
-            await run_blocking(extract_audio_stream, vid)
-        except:
-            pass
-
-# ===============================
-# YouTube Search
-# ===============================
-def yt_search(query: str) -> List[Dict]:
     with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
-        data = ydl.extract_info(f"ytsearch{SEARCH_LIMIT}:{query}", download=False)
+        data = ydl.extract_info(
+            f"ytsearch{SEARCH_LIMIT}:{query}",
+            download=False
+        )
 
     results = []
-    for v in data.get("entries", []):
-        thumb = v["thumbnails"][-1]["url"] if v.get("thumbnails") else None
+
+    for v in data.get("entries",[]):
+
+        thumb = None
+        if v.get("thumbnails"):
+            thumb = v["thumbnails"][-1]["url"]
+
         results.append({
             "id": v.get("id"),
             "title": v.get("title"),
             "thumbnail": thumb,
             "duration": v.get("duration"),
-            "channel": v.get("uploader"),
+            "channel": v.get("uploader")
         })
+
     return results
 
-# ===============================
+# =========================
 # Download audio
-# ===============================
+# =========================
 def download_audio(video_id):
+
     cleanup_cache()
+
+    url = f"https://youtube.com/watch?v={video_id}"
+
+    time.sleep(random.uniform(0.5,1.5))
+
     with yt_dlp.YoutubeDL(DOWNLOAD_OPTS) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-        path = ydl.prepare_filename(info)
-    return path
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
 
-# ===============================
-# Fetch Ad Videos from Channel
-# ===============================
-def fetch_ad_videos():
-    global AD_VIDEOS_CACHE
-    if AD_VIDEOS_CACHE:
-        return AD_VIDEOS_CACHE
-    with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
-        info = ydl.extract_info(f"{AD_CHANNEL_URL}", download=False)
-        videos = [v["id"] for v in info.get("entries", []) if v.get("id")]
-        AD_VIDEOS_CACHE = videos
-        return videos
-
-# ===============================
+# =========================
 # Routes
-# ===============================
+# =========================
 @app.get("/")
-def home():
-    # 10% chance (AD_PERCENT) to send ad
-    if random.randint(1, 100) <= AD_PERCENT:
-        try:
-            videos = fetch_ad_videos()
-            if videos:
-                vid = random.choice(videos)
-                audio_url = extract_audio_stream(vid)
-                return {"ad_audio_url": audio_url, "ad_video_id": vid}
-        except Exception as e:
-            log.warning(f"Failed to serve ad: {e}")
-    return {"status": "running"}
+async def home():
+    return {"status":"running"}
 
-# -------------------------------
 @app.get("/search")
-async def search(q: str):
+async def search(q:str):
+
     if not q:
-        raise HTTPException(400, "Query required")
-    try:
-        results = await run_blocking(yt_search, q)
-        asyncio.create_task(prefetch_streams(results))
-        return JSONResponse(results)
-    except Exception as e:
-        raise HTTPException(500, f"Search failed: {e}")
+        raise HTTPException(400,"Query required")
 
-# -------------------------------
+    try:
+        return await run_blocking(yt_search,q)
+    except Exception as e:
+        raise HTTPException(500,str(e))
+
 @app.get("/stream")
-async def stream(video_id: str):
-    if not video_id:
-        raise HTTPException(400, "video_id required")
-    try:
-        url = await run_blocking(extract_audio_stream, video_id)
-        return {"audio_url": url, "cached": True}
-    except Exception as e:
-        raise HTTPException(500, f"Stream extraction failed: {e}")
+async def stream(video_id:str):
 
-# -------------------------------
-@app.get("/download")
-async def download(video_id: str):
     if not video_id:
-        raise HTTPException(400, "video_id required")
+        raise HTTPException(400,"video_id required")
+
     try:
+        url = await run_blocking(extract_stream,video_id)
+        return {"audio_url":url}
+    except Exception as e:
+        raise HTTPException(500,f"Stream failed: {e}")
+
+@app.get("/download")
+async def download(video_id:str):
+
+    if not video_id:
+        raise HTTPException(400,"video_id required")
+
+    try:
+
         for f in os.listdir(CACHE_DIR):
             if f.startswith(video_id):
-                path = os.path.join(CACHE_DIR, f)
-                return FileResponse(path, filename=os.path.basename(path), media_type="audio/mpeg")
-        path = await run_blocking(download_audio, video_id)
-        return FileResponse(path, filename=os.path.basename(path), media_type="audio/mpeg")
+                path = os.path.join(CACHE_DIR,f)
+                return FileResponse(path,filename=f)
+
+        path = await run_blocking(download_audio,video_id)
+
+        return FileResponse(
+            path,
+            filename=os.path.basename(path)
+        )
+
     except Exception as e:
-        raise HTTPException(500, f"Download failed: {e}")
+        raise HTTPException(500,f"Download failed: {e}")
 
-# -------------------------------
-@app.post("/admin")
-async def admin(ad_percent: int = None):
-    global AD_PERCENT
-    if ad_percent is not None:
-        AD_PERCENT = max(0, min(100, ad_percent))
-    return {"ad_percent": AD_PERCENT}
+# =========================
+# Prefetch next audio
+# =========================
+@app.post("/prefetch")
+async def prefetch(video_ids:List[str]):
 
-# ===============================
-# Run Server
-# ===============================
+    tasks = [
+        run_blocking(extract_stream,vid)
+        for vid in video_ids[:5]
+    ]
+
+    asyncio.create_task(asyncio.gather(*tasks))
+
+    return {"status":"prefetch started"}
+
+# =========================
+# Start server
+# =========================
 if __name__ == "__main__":
+
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+    port = int(os.environ.get("PORT",8000))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
