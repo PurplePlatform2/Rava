@@ -2,6 +2,7 @@ import asyncio
 import time
 import random
 import logging
+import os
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException
